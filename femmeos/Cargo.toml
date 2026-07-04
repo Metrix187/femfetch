@@ -1,0 +1,18 @@
+[package]
+name = "femfetch-femmeos"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "femfetch, but running bare-metal on FemmeOS via femapi."
+
+[[bin]]
+name = "femfetch"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+
+[profile.dev]
+panic = "abort"

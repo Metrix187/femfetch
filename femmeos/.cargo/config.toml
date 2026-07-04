@@ -1,0 +1,21 @@
+# two targets, two loading schemes:
+#   x86_64-unknown-none      -> static-pie, femos relocates it into its arena
+#   i686-unknown-linux-gnu   -> "linux" in name only (no_std); static ET_EXEC
+#                               at the fixed address femos reserves. the
+#                               kernel never enables SSE, hence the -sse soup.
+
+[target.x86_64-unknown-none]
+rustflags = ["-C", "relocation-model=pie"]
+
+# rustc warns that disabling sse2 bends the float ABI -- true, but no float
+# ever crosses a function boundary in this crate, so it's noise here.
+[target.i686-unknown-linux-gnu]
+linker = "rust-lld"
+rustflags = [
+  "-C", "linker-flavor=ld.lld",
+  "-C", "relocation-model=static",
+  "-C", "target-feature=-sse,-sse2",
+  "-C", "link-arg=--script=link32.ld",
+  "-C", "link-arg=-static",
+  "-C", "link-arg=-n",
+]
