@@ -1,17 +1,21 @@
-use crate::platform::{Platform, ThemeInfo};
+use crate::platform::{BatteryInfo, Platform, ThemeInfo};
 use crate::util::first_non_empty;
 use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::OsStrExt;
 use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, MAX_PATH};
-use windows_sys::Win32::Graphics::Gdi::{EnumDisplayDevicesW, EnumDisplaySettingsW, DISPLAY_DEVICEW, DEVMODEW, ENUM_CURRENT_SETTINGS};
-use windows_sys::Win32::NetworkManagement::IpHelper::{GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH};
+use windows_sys::Win32::Graphics::Gdi::{
+    EnumDisplayDevicesW, EnumDisplaySettingsW, DEVMODEW, DISPLAY_DEVICEW, ENUM_CURRENT_SETTINGS,
+};
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+};
+use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
 use windows_sys::Win32::System::SystemInformation::{
-    GetComputerNameExW, GetSystemInfo, GlobalMemoryStatusEx, OSVERSIONINFOW, SYSTEM_INFO,
+    ComputerNameDnsHostname, GetComputerNameExW, GetSystemInfo, GetTickCount64,
+    GlobalMemoryStatusEx, SYSTEM_INFO,
 };
-use windows_sys::Win32::System::Threading::GetTickCount64;
-use windows_sys::Win32::UI::WindowsAndMessaging::COMPUTER_NAME_FORMAT;
 
 pub struct WindowsPlatform {}
 
@@ -39,12 +43,14 @@ impl Platform for WindowsPlatform {
     }
 
     fn host(&self) -> Option<String> {
-        get_computer_name(COMPUTER_NAME_FORMAT::ComputerNameDnsHostname as u32)
+        get_computer_name(ComputerNameDnsHostname)
     }
 
     fn model(&self) -> Option<String> {
-        let vendor = read_registry_string(r"HARDWARE\DESCRIPTION\System\BIOS", "SystemManufacturer");
-        let product = read_registry_string(r"HARDWARE\DESCRIPTION\System\BIOS", "SystemProductName");
+        let vendor =
+            read_registry_string(r"HARDWARE\DESCRIPTION\System\BIOS", "SystemManufacturer");
+        let product =
+            read_registry_string(r"HARDWARE\DESCRIPTION\System\BIOS", "SystemProductName");
         match (vendor, product) {
             (Some(v), Some(p)) => Some(format!("{v} {p}")),
             (Some(v), None) => Some(v),
@@ -54,8 +60,15 @@ impl Platform for WindowsPlatform {
     }
 
     fn kernel(&self) -> Option<String> {
-        let version = rtl_version();
-        version.map(|(maj, min, build)| format!("NT {maj}.{min}.{build}"))
+        read_registry_string(
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+            "CurrentVersion",
+        )
+        .zip(read_registry_string(
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+            "CurrentBuildNumber",
+        ))
+        .map(|(version, build)| format!("NT {version}.{build}"))
     }
 
     fn uptime_seconds(&self) -> Option<u64> {
@@ -67,10 +80,7 @@ impl Platform for WindowsPlatform {
     }
 
     fn shell(&self) -> Option<String> {
-        first_non_empty(&[
-            std::env::var("COMSPEC").ok(),
-            std::env::var("SHELL").ok(),
-        ])
+        first_non_empty(&[std::env::var("COMSPEC").ok(), std::env::var("SHELL").ok()])
     }
 
     fn resolutions(&self) -> Option<String> {
@@ -85,7 +95,13 @@ impl Platform for WindowsPlatform {
             }
             let mut devmode: DEVMODEW = unsafe { std::mem::zeroed() };
             devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
-            let ok = unsafe { EnumDisplaySettingsW(device.DeviceName.as_ptr(), ENUM_CURRENT_SETTINGS, &mut devmode) };
+            let ok = unsafe {
+                EnumDisplaySettingsW(
+                    device.DeviceName.as_ptr(),
+                    ENUM_CURRENT_SETTINGS,
+                    &mut devmode,
+                )
+            };
             if ok != 0 {
                 modes.push(format!("{}x{}", devmode.dmPelsWidth, devmode.dmPelsHeight));
             }
@@ -111,7 +127,9 @@ impl Platform for WindowsPlatform {
         first_non_empty(&[
             std::env::var("TERM_PROGRAM").ok(),
             std::env::var("TERM").ok(),
-            std::env::var("ConEmuPID").ok().map(|_| "ConEmu".to_string()),
+            std::env::var("ConEmuPID")
+                .ok()
+                .map(|_| "ConEmu".to_string()),
         ])
     }
 
@@ -148,7 +166,9 @@ impl Platform for WindowsPlatform {
     fn memory(&self) -> Option<(u64, u64)> {
         let mut mem: windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX =
             unsafe { std::mem::zeroed() };
-        mem.dwLength = std::mem::size_of::<windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX>() as u32;
+        mem.dwLength = std::mem::size_of::<
+            windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX,
+        >() as u32;
         let ok = unsafe { GlobalMemoryStatusEx(&mut mem) };
         if ok == 0 {
             return None;
@@ -169,39 +189,7 @@ impl Platform for WindowsPlatform {
     }
 
     fn local_ip(&self) -> Option<String> {
-        unsafe {
-            let mut buf_len: u32 = 0;
-            let res = GetAdaptersAddresses(0, 0, null_mut(), null_mut(), &mut buf_len);
-            if res != ERROR_BUFFER_OVERFLOW {
-                return None;
-            }
-            let mut buffer = vec![0u8; buf_len as usize];
-            let addr_ptr = buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
-            let res = GetAdaptersAddresses(0, 0, null_mut(), addr_ptr, &mut buf_len);
-            if res != 0 {
-                return None;
-            }
-            let mut current = addr_ptr;
-            while !current.is_null() {
-                let unicast = (*current).FirstUnicastAddress;
-                if !unicast.is_null() {
-                    let sock_addr = (*unicast).Address.lpSockaddr;
-                    if !sock_addr.is_null() {
-                        let family = (*sock_addr).sa_family;
-                        if family as i32 == windows_sys::Win32::Networking::WinSock::AF_INET {
-                            let sockaddr_in = sock_addr as *const windows_sys::Win32::Networking::WinSock::SOCKADDR_IN;
-                            let addr = (*sockaddr_in).sin_addr.S_un.S_addr;
-                            let ip = std::net::Ipv4Addr::from(u32::from_be(addr));
-                            if !ip.is_loopback() {
-                                return Some(ip.to_string());
-                            }
-                        }
-                    }
-                }
-                current = (*current).Next;
-            }
-        }
-        None
+        active_adapter().map(|(_, ip)| ip.to_string())
     }
 
     fn theme_info(&self) -> ThemeInfo {
@@ -211,6 +199,44 @@ impl Platform for WindowsPlatform {
             font: None,
             cursor: None,
         }
+    }
+
+    fn battery(&self) -> Option<BatteryInfo> {
+        let mut status: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+        if unsafe { GetSystemPowerStatus(&mut status) } == 0 || status.BatteryFlag == 128 {
+            return None;
+        }
+        let state = match status.ACLineStatus {
+            1 if status.BatteryFlag & 8 != 0 => "Full",
+            1 => "Charging",
+            0 => "Discharging",
+            _ => "Unknown",
+        };
+        Some(BatteryInfo {
+            capacity: status.BatteryLifePercent.min(100),
+            status: Some(state.to_string()),
+        })
+    }
+
+    fn motherboard(&self) -> Option<String> {
+        let vendor =
+            read_registry_string(r"HARDWARE\DESCRIPTION\System\BIOS", "BaseBoardManufacturer");
+        let product = read_registry_string(r"HARDWARE\DESCRIPTION\System\BIOS", "BaseBoardProduct");
+        combine(vendor, product)
+    }
+
+    fn bios(&self) -> Option<String> {
+        let vendor = read_registry_string(r"HARDWARE\DESCRIPTION\System\BIOS", "BIOSVendor");
+        let version = read_registry_string(r"HARDWARE\DESCRIPTION\System\BIOS", "BIOSVersion");
+        combine(vendor, version)
+    }
+
+    fn network_interface(&self) -> Option<String> {
+        active_adapter().map(|(name, _)| name)
+    }
+
+    fn network_connected(&self) -> bool {
+        active_adapter().is_some()
     }
 }
 
@@ -240,7 +266,7 @@ fn read_registry_string(path: &str, value: &str) -> Option<String> {
     Some(String::from_utf16_lossy(slice).trim().to_string())
 }
 
-fn get_computer_name(format: u32) -> Option<String> {
+fn get_computer_name(format: i32) -> Option<String> {
     let mut buffer = vec![0u16; MAX_PATH as usize];
     let mut size = buffer.len() as u32;
     let ok = unsafe { GetComputerNameExW(format, buffer.as_mut_ptr(), &mut size) };
@@ -248,17 +274,6 @@ fn get_computer_name(format: u32) -> Option<String> {
         return None;
     }
     Some(String::from_utf16_lossy(&buffer[..size as usize]))
-}
-
-fn rtl_version() -> Option<(u32, u32, u32)> {
-    let mut info: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
-    info.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
-    let status = unsafe { windows_sys::Win32::System::SystemInformation::RtlGetVersion(&mut info) };
-    if status != 0 {
-        None
-    } else {
-        Some((info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber))
-    }
 }
 
 fn disk_for_drive(drive: &str) -> Option<(u64, u64)> {
@@ -315,10 +330,69 @@ fn disk_all_drives() -> Option<(u64, u64)> {
 }
 
 fn to_wide(value: &str) -> Vec<u16> {
-    OsString::from(value).encode_wide().chain(std::iter::once(0)).collect()
+    OsString::from(value)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 fn widestring_to_string(buffer: &[u16]) -> String {
     let len = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
     String::from_utf16_lossy(&buffer[..len]).trim().to_string()
+}
+
+fn combine(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) if first != second => Some(format!("{first} {second}")),
+        (Some(first), _) => Some(first),
+        (_, Some(second)) => Some(second),
+        _ => None,
+    }
+}
+
+fn active_adapter() -> Option<(String, std::net::Ipv4Addr)> {
+    unsafe {
+        let mut buffer_len = 0;
+        if GetAdaptersAddresses(0, 0, null_mut(), null_mut(), &mut buffer_len)
+            != ERROR_BUFFER_OVERFLOW
+        {
+            return None;
+        }
+        let mut buffer = vec![0u8; buffer_len as usize];
+        let addresses = buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
+        if GetAdaptersAddresses(0, 0, null_mut(), addresses, &mut buffer_len) != 0 {
+            return None;
+        }
+        let mut current = addresses;
+        while !current.is_null() {
+            let unicast = (*current).FirstUnicastAddress;
+            if !unicast.is_null() {
+                let socket = (*unicast).Address.lpSockaddr;
+                if !socket.is_null()
+                    && (*socket).sa_family == windows_sys::Win32::Networking::WinSock::AF_INET
+                {
+                    let socket =
+                        socket as *const windows_sys::Win32::Networking::WinSock::SOCKADDR_IN;
+                    let ip = std::net::Ipv4Addr::from(u32::from_be((*socket).sin_addr.S_un.S_addr));
+                    if !ip.is_loopback() {
+                        let name = if (*current).FriendlyName.is_null() {
+                            "Network".to_string()
+                        } else {
+                            let mut len = 0;
+                            while *(*current).FriendlyName.add(len) != 0 {
+                                len += 1;
+                            }
+                            String::from_utf16_lossy(std::slice::from_raw_parts(
+                                (*current).FriendlyName,
+                                len,
+                            ))
+                        };
+                        return Some((name, ip));
+                    }
+                }
+            }
+            current = (*current).Next;
+        }
+        None
+    }
 }

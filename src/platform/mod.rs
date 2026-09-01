@@ -11,71 +11,61 @@ pub struct ThemeInfo {
     pub cursor: Option<String>,
 }
 
-pub fn os_name_version() -> Option<String> {
-    platform().os_name_version()
+#[derive(Debug, Clone)]
+pub struct BatteryInfo {
+    pub capacity: u8,
+    pub status: Option<String>,
 }
 
-pub fn host() -> Option<String> {
-    platform().host()
+macro_rules! platform_getter {
+    ($name:ident, $return:ty) => {
+        pub fn $name() -> $return {
+            platform().$name()
+        }
+    };
 }
 
-pub fn model() -> Option<String> {
-    platform().model()
-}
-
-pub fn kernel() -> Option<String> {
-    platform().kernel()
-}
-
-pub fn uptime_seconds() -> Option<u64> {
-    platform().uptime_seconds()
-}
-
-pub fn packages() -> Option<String> {
-    platform().packages()
-}
-
-pub fn shell() -> Option<String> {
-    platform().shell()
-}
-
-pub fn resolutions() -> Option<String> {
-    platform().resolutions()
-}
-
-pub fn de_wm() -> Option<String> {
-    platform().de_wm()
-}
-
-pub fn terminal() -> Option<String> {
-    platform().terminal()
-}
-
-pub fn cpu() -> Option<String> {
-    platform().cpu()
-}
-
-pub fn gpu() -> Option<String> {
-    platform().gpu()
-}
-
-pub fn memory() -> Option<(u64, u64)> {
-    platform().memory()
-}
+platform_getter!(os_name_version, Option<String>);
+platform_getter!(host, Option<String>);
+platform_getter!(model, Option<String>);
+platform_getter!(kernel, Option<String>);
+platform_getter!(uptime_seconds, Option<u64>);
+platform_getter!(packages, Option<String>);
+platform_getter!(shell, Option<String>);
+platform_getter!(resolutions, Option<String>);
+platform_getter!(de_wm, Option<String>);
+platform_getter!(terminal, Option<String>);
+platform_getter!(cpu, Option<String>);
+platform_getter!(gpu, Option<String>);
+platform_getter!(memory, Option<(u64, u64)>);
+platform_getter!(local_ip, Option<String>);
+platform_getter!(theme_info, ThemeInfo);
+platform_getter!(cpu_temperature, Option<f64>);
+platform_getter!(cpu_utilization, Option<f64>);
+platform_getter!(cpu_frequency, Option<f64>);
+platform_getter!(gpu_temperature, Option<f64>);
+platform_getter!(gpu_utilization, Option<f64>);
+platform_getter!(vram, Option<(u64, u64)>);
+platform_getter!(battery, Option<BatteryInfo>);
+platform_getter!(battery_health, Option<f64>);
+platform_getter!(swap, Option<(u64, u64)>);
+platform_getter!(motherboard, Option<String>);
+platform_getter!(bios, Option<String>);
+platform_getter!(storage_model, Option<String>);
+platform_getter!(filesystem, Option<String>);
+platform_getter!(network_interface, Option<String>);
+platform_getter!(wifi, Option<String>);
+platform_getter!(monitor, Option<String>);
 
 pub fn disk(all_mounts: bool) -> Option<(u64, u64)> {
     platform().disk(all_mounts)
 }
 
-pub fn local_ip() -> Option<String> {
-    platform().local_ip()
+pub fn network_connected() -> bool {
+    platform().network_connected()
 }
 
-pub fn theme_info() -> ThemeInfo {
-    platform().theme_info()
-}
-
-trait Platform {
+trait Platform: Sync {
     fn os_name_version(&self) -> Option<String>;
     fn host(&self) -> Option<String>;
     fn model(&self) -> Option<String>;
@@ -92,15 +82,68 @@ trait Platform {
     fn disk(&self, all_mounts: bool) -> Option<(u64, u64)>;
     fn local_ip(&self) -> Option<String>;
     fn theme_info(&self) -> ThemeInfo;
+    fn cpu_temperature(&self) -> Option<f64> {
+        None
+    }
+    fn cpu_utilization(&self) -> Option<f64> {
+        None
+    }
+    fn cpu_frequency(&self) -> Option<f64> {
+        None
+    }
+    fn gpu_temperature(&self) -> Option<f64> {
+        None
+    }
+    fn gpu_utilization(&self) -> Option<f64> {
+        None
+    }
+    fn vram(&self) -> Option<(u64, u64)> {
+        None
+    }
+    fn battery(&self) -> Option<BatteryInfo> {
+        None
+    }
+    fn battery_health(&self) -> Option<f64> {
+        None
+    }
+    fn swap(&self) -> Option<(u64, u64)> {
+        None
+    }
+    fn motherboard(&self) -> Option<String> {
+        None
+    }
+    fn bios(&self) -> Option<String> {
+        None
+    }
+    fn storage_model(&self) -> Option<String> {
+        None
+    }
+    fn filesystem(&self) -> Option<String> {
+        None
+    }
+    fn network_interface(&self) -> Option<String> {
+        None
+    }
+    fn wifi(&self) -> Option<String> {
+        None
+    }
+    fn network_connected(&self) -> bool {
+        self.local_ip().is_some()
+    }
+    fn monitor(&self) -> Option<String> {
+        self.resolutions()
+    }
 }
 
-fn platform() -> Box<dyn Platform> {
+fn platform() -> &'static dyn Platform {
     #[cfg(target_os = "linux")]
     {
-        Box::new(linux::LinuxPlatform {})
+        static PLATFORM: linux::LinuxPlatform = linux::LinuxPlatform {};
+        &PLATFORM
     }
     #[cfg(windows)]
     {
-        Box::new(windows::WindowsPlatform {})
+        static PLATFORM: windows::WindowsPlatform = windows::WindowsPlatform {};
+        &PLATFORM
     }
 }

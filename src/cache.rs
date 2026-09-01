@@ -1,5 +1,5 @@
-use crate::ModuleResult;
 use crate::util::now_epoch_seconds;
+use crate::ModuleResult;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -36,7 +36,12 @@ pub fn write_cache(key: &str, modules: &[ModuleResult]) -> Result<(), String> {
         modules: modules.to_vec(),
     };
     let data = serde_json::to_string(&entry).map_err(|e| format!("Cache encode error: {e}"))?;
-    fs::write(path, data).map_err(|e| format!("Cache write error: {e}"))?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temporary, data).map_err(|e| format!("Cache write error: {e}"))?;
+    fs::rename(&temporary, &path).map_err(|e| {
+        let _ = fs::remove_file(&temporary);
+        format!("Cache replace error: {e}")
+    })?;
     Ok(())
 }
 
