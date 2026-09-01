@@ -9,6 +9,8 @@ pub struct Theme {
     muted: &'static str,
 }
 
+const NAMES: &[&str] = &["pastel", "mint", "sunset"];
+
 impl Theme {
     pub fn accent(&self, text: &str) -> String {
         self.paint(self.accent, text)
@@ -39,9 +41,21 @@ impl Theme {
     }
 }
 
-pub fn get_theme(name: &str, no_color: bool) -> Theme {
-    let name = name.to_lowercase();
-    match name.as_str() {
+pub fn names() -> &'static [&'static str] {
+    NAMES
+}
+
+pub fn get_theme(name: &str, no_color: bool) -> Result<Theme, String> {
+    let theme = match name.to_ascii_lowercase().as_str() {
+        "pastel" => Theme {
+            name: "pastel",
+            no_color,
+            accent: "\u{1b}[38;2;203;189;255m",
+            label: "\u{1b}[38;2;255;209;227m",
+            value: "\u{1b}[38;2;245;245;255m",
+            border: "\u{1b}[38;2;198;199;255m",
+            muted: "\u{1b}[38;2;199;199;214m",
+        },
         "mint" => Theme {
             name: "mint",
             no_color,
@@ -60,14 +74,12 @@ pub fn get_theme(name: &str, no_color: bool) -> Theme {
             border: "\u{1b}[38;2;255;198;214m",
             muted: "\u{1b}[38;2;231;175;186m",
         },
-        _ => Theme {
-            name: "pastel",
-            no_color,
-            accent: "\u{1b}[38;2;203;189;255m",
-            label: "\u{1b}[38;2;255;209;227m",
-            value: "\u{1b}[38;2;245;245;255m",
-            border: "\u{1b}[38;2;198;199;255m",
-            muted: "\u{1b}[38;2;199;199;214m",
-        },
-    }
+        _ => {
+            return Err(format!(
+                "Unknown theme: {name}. Available themes: {}",
+                NAMES.join(", ")
+            ))
+        }
+    };
+    Ok(theme)
 }

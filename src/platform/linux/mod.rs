@@ -1,10 +1,13 @@
-use crate::platform::{Platform, ThemeInfo};
+use crate::platform::{BatteryInfo, Platform, ThemeInfo};
 use crate::util::first_non_empty;
-use libc::{getifaddrs, statvfs, freeifaddrs, sockaddr, sockaddr_in, AF_INET, IFF_LOOPBACK};
+use libc::{freeifaddrs, getifaddrs, sockaddr, sockaddr_in, statvfs, AF_INET, IFF_LOOPBACK};
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::net::Ipv4Addr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 pub struct LinuxPlatform {}
 
@@ -257,6 +260,104 @@ impl Platform for LinuxPlatform {
             cursor: read_gtk_setting("gtk-cursor-theme-name"),
         }
     }
+
+    fn cpu_temperature(&self) -> Option<f64> {
+        read_temperature(&["x86_pkg_temp", "cpu_thermal", "k10temp", "coretemp"])
+            .or_else(|| read_hwmon_temperature("temp1_input"))
+    }
+
+    fn cpu_utilization(&self) -> Option<f64> {
+        let first = read_cpu_times()?;
+        thread::sleep(Duration::from_millis(100));
+        let second = read_cpu_times()?;
+        cpu_usage_between(first, second)
+    }
+
+    fn cpu_frequency(&self) -> Option<f64> {
+        let khz = read_u64("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")?;
+        Some(khz as f64 / 1_000.0)
+    }
+
+    fn gpu_temperature(&self) -> Option<f64> {
+        read_temperature(&["amdgpu", "nouveau", "i915"])
+    }
+
+    fn gpu_utilization(&self) -> Option<f64> {
+        first_matching_card_value("gpu_busy_percent").map(|value| value as f64)
+    }
+
+    fn vram(&self) -> Option<(u64, u64)> {
+        let total = first_matching_card_value("mem_info_vram_total")?;
+        let used = first_matching_card_value("mem_info_vram_used")?;
+        Some((total, used))
+    }
+
+    fn battery(&self) -> Option<BatteryInfo> {
+        let path = first_power_supply("Battery")?;
+        let capacity = read_u64(path.join("capacity"))?.min(100) as u8;
+        let status = fs::read_to_string(path.join("status"))
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        Some(BatteryInfo { capacity, status })
+    }
+
+    fn battery_health(&self) -> Option<f64> {
+        let path = first_power_supply("Battery")?;
+        let full =
+            read_u64(path.join("energy_full")).or_else(|| read_u64(path.join("charge_full")))?;
+        let design = read_u64(path.join("energy_full_design"))
+            .or_else(|| read_u64(path.join("charge_full_design")))?;
+        (design > 0).then_some((full as f64 / design as f64 * 100.0).min(100.0))
+    }
+
+    fn swap(&self) -> Option<(u64, u64)> {
+        let contents = fs::read_to_string("/proc/meminfo").ok()?;
+        parse_swap(&contents)
+    }
+
+    fn motherboard(&self) -> Option<String> {
+        combine_files(
+            "/sys/devices/virtual/dmi/id/board_vendor",
+            "/sys/devices/virtual/dmi/id/board_name",
+        )
+    }
+
+    fn bios(&self) -> Option<String> {
+        combine_files(
+            "/sys/devices/virtual/dmi/id/bios_vendor",
+            "/sys/devices/virtual/dmi/id/bios_version",
+        )
+    }
+
+    fn storage_model(&self) -> Option<String> {
+        storage_models()
+    }
+
+    fn filesystem(&self) -> Option<String> {
+        filesystem_for_root()
+    }
+
+    fn network_interface(&self) -> Option<String> {
+        default_network_interface()
+    }
+
+    fn wifi(&self) -> Option<String> {
+        let interface = default_network_interface()?;
+        Path::new("/sys/class/net")
+            .join(&interface)
+            .join("wireless")
+            .exists()
+            .then_some(interface)
+    }
+
+    fn network_connected(&self) -> bool {
+        default_network_interface().is_some()
+    }
+
+    fn monitor(&self) -> Option<String> {
+        monitor_info()
+    }
 }
 
 fn trim_os_release(value: &str) -> String {
@@ -284,38 +385,45 @@ fn disk_all_mounts() -> Option<(u64, u64)> {
     let mounts = fs::read_to_string("/proc/mounts").ok()?;
     let mut total = 0;
     let mut used = 0;
+    let mut devices = HashSet::new();
     for line in mounts.lines() {
         let mut parts = line.split_whitespace();
-        let _device = parts.next();
+        let device = parts.next().unwrap_or("");
         let mount = parts.next().unwrap_or("");
         let fstype = parts.next().unwrap_or("");
-        if mount.starts_with("/proc")
+        if !devices.insert(device)
+            || mount.starts_with("/proc")
             || mount.starts_with("/sys")
             || mount.starts_with("/run")
             || mount.starts_with("/dev")
-            || fstype == "tmpfs"
-            || fstype == "sysfs"
-            || fstype == "proc"
-            || fstype == "devtmpfs"
+            || matches!(
+                fstype,
+                "tmpfs" | "sysfs" | "proc" | "devtmpfs" | "squashfs" | "overlay"
+            )
             || fstype.starts_with("cgroup")
         {
             continue;
         }
-        if let Some((t, u)) = disk_for_path(Path::new(mount)) {
-            total += t;
-            used += u;
+        if let Some((disk_total, disk_used)) = disk_for_path(Path::new(mount)) {
+            total += disk_total;
+            used += disk_used;
         }
     }
-    if total == 0 {
-        None
-    } else {
-        Some((total, used))
-    }
+    (total > 0).then_some((total, used))
 }
 
 fn count_dpkg_packages() -> Option<u64> {
     let contents = fs::read_to_string("/var/lib/dpkg/status").ok()?;
-    Some(contents.lines().filter(|l| l.starts_with("Package: ")).count() as u64)
+    Some(
+        contents
+            .split("\n\n")
+            .filter(|entry| {
+                entry
+                    .lines()
+                    .any(|line| line == "Status: install ok installed")
+            })
+            .count() as u64,
+    )
 }
 
 fn count_pacman_packages() -> Option<u64> {
@@ -330,7 +438,9 @@ fn count_pacman_packages() -> Option<u64> {
 }
 
 fn count_rpm_packages() -> Option<u64> {
-    if Path::new("/var/lib/rpm/Packages").exists() || Path::new("/var/lib/rpm/rpmdb.sqlite").exists() {
+    if Path::new("/var/lib/rpm/Packages").exists()
+        || Path::new("/var/lib/rpm/rpmdb.sqlite").exists()
+    {
         if let Some(count) = count_rpm_with_command() {
             return Some(count);
         }
@@ -391,4 +501,209 @@ fn trim_gtk_value(value: &str) -> String {
 fn sockaddr_in_from(addr: &sockaddr) -> Ipv4Addr {
     let addr_in: &sockaddr_in = unsafe { &*(addr as *const sockaddr as *const sockaddr_in) };
     Ipv4Addr::from(u32::from_be(addr_in.sin_addr.s_addr))
+}
+
+fn read_u64(path: impl AsRef<Path>) -> Option<u64> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn read_temperature(preferred_types: &[&str]) -> Option<f64> {
+    let thermal = fs::read_dir("/sys/class/thermal").ok()?;
+    for entry in thermal.flatten() {
+        let path = entry.path();
+        let kind = fs::read_to_string(path.join("type")).unwrap_or_default();
+        if preferred_types
+            .iter()
+            .any(|name| kind.trim().contains(name))
+        {
+            if let Some(value) = temperature_value(path.join("temp")) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn read_hwmon_temperature(file: &str) -> Option<f64> {
+    for entry in fs::read_dir("/sys/class/hwmon").ok()?.flatten() {
+        if let Some(value) = temperature_value(entry.path().join(file)) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn temperature_value(path: impl AsRef<Path>) -> Option<f64> {
+    let raw = fs::read_to_string(path).ok()?.trim().parse::<f64>().ok()?;
+    let value = if raw.abs() > 1_000.0 {
+        raw / 1_000.0
+    } else {
+        raw
+    };
+    (-50.0..=200.0).contains(&value).then_some(value)
+}
+
+fn read_cpu_times() -> Option<(u64, u64)> {
+    let contents = fs::read_to_string("/proc/stat").ok()?;
+    parse_cpu_times(contents.lines().next()?)
+}
+
+fn parse_cpu_times(line: &str) -> Option<(u64, u64)> {
+    let mut values = line.split_whitespace();
+    if values.next()? != "cpu" {
+        return None;
+    }
+    let fields: Vec<u64> = values.filter_map(|value| value.parse().ok()).collect();
+    if fields.len() < 4 {
+        return None;
+    }
+    let total = fields.iter().copied().sum();
+    let idle = fields[3] + fields.get(4).copied().unwrap_or(0);
+    Some((total, idle))
+}
+
+fn cpu_usage_between(first: (u64, u64), second: (u64, u64)) -> Option<f64> {
+    let total = second.0.saturating_sub(first.0);
+    let idle = second.1.saturating_sub(first.1);
+    (total > 0).then_some((total.saturating_sub(idle)) as f64 / total as f64 * 100.0)
+}
+
+fn first_matching_card_value(name: &str) -> Option<u64> {
+    for index in 0..16 {
+        let path = format!("/sys/class/drm/card{index}/device/{name}");
+        if let Some(value) = read_u64(path) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn first_power_supply(kind: &str) -> Option<PathBuf> {
+    for entry in fs::read_dir("/sys/class/power_supply").ok()?.flatten() {
+        let path = entry.path();
+        let actual = fs::read_to_string(path.join("type")).unwrap_or_default();
+        if actual.trim() == kind {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn parse_swap(contents: &str) -> Option<(u64, u64)> {
+    let mut total = None;
+    let mut free = None;
+    for line in contents.lines() {
+        if line.starts_with("SwapTotal:") {
+            total = parse_kib(line);
+        } else if line.starts_with("SwapFree:") {
+            free = parse_kib(line);
+        }
+    }
+    let total = total? * 1024;
+    let free = free.unwrap_or(0) * 1024;
+    Some((total, total.saturating_sub(free)))
+}
+
+fn combine_files(first: &str, second: &str) -> Option<String> {
+    let first = fs::read_to_string(first)
+        .ok()
+        .map(|value| value.trim().to_string());
+    let second = fs::read_to_string(second)
+        .ok()
+        .map(|value| value.trim().to_string());
+    match (
+        first.filter(|value| !value.is_empty()),
+        second.filter(|value| !value.is_empty()),
+    ) {
+        (Some(first), Some(second)) if first != second => Some(format!("{first} {second}")),
+        (Some(first), _) => Some(first),
+        (_, Some(second)) => Some(second),
+        _ => None,
+    }
+}
+
+fn storage_models() -> Option<String> {
+    let mut models = Vec::new();
+    for entry in fs::read_dir("/sys/block").ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("loop") || name.starts_with("ram") || name.starts_with("zram") {
+            continue;
+        }
+        let model = fs::read_to_string(entry.path().join("device/model"))
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| name.into_owned());
+        models.push(model);
+    }
+    models.sort();
+    models.dedup();
+    (!models.is_empty()).then(|| models.join(", "))
+}
+
+fn filesystem_for_root() -> Option<String> {
+    let mounts = fs::read_to_string("/proc/mounts").ok()?;
+    mounts.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let device = fields.next()?;
+        let mount = fields.next()?;
+        let filesystem = fields.next()?;
+        (mount == "/").then(|| format!("{filesystem} ({device})"))
+    })
+}
+
+fn default_network_interface() -> Option<String> {
+    let routes = fs::read_to_string("/proc/net/route").ok()?;
+    for line in routes.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let interface = fields.next()?;
+        let destination = fields.next()?;
+        let gateway = fields.next()?;
+        let flags = u16::from_str_radix(fields.next()?, 16).ok()?;
+        if destination == "00000000" && gateway != "00000000" && flags & 1 != 0 {
+            return Some(interface.to_string());
+        }
+    }
+    None
+}
+
+fn monitor_info() -> Option<String> {
+    let mut monitors = Vec::new();
+    for entry in fs::read_dir("/sys/class/drm").ok()?.flatten() {
+        let path = entry.path();
+        if fs::read_to_string(path.join("status")).ok()?.trim() != "connected" {
+            continue;
+        }
+        let mode = fs::read_to_string(path.join("modes"))
+            .ok()
+            .and_then(|contents| contents.lines().next().map(str::to_string));
+        let connector = entry.file_name().to_string_lossy().into_owned();
+        monitors.push(match mode {
+            Some(mode) => format!("{connector} {mode}"),
+            None => connector,
+        });
+    }
+    (!monitors.is_empty()).then(|| monitors.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_cpu_times_and_usage() {
+        assert_eq!(
+            parse_cpu_times("cpu  100 2 30 400 10 0 0 0"),
+            Some((542, 410))
+        );
+        let usage = cpu_usage_between((100, 80), (200, 130)).unwrap();
+        assert!((usage - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parses_swap_usage() {
+        let swap = parse_swap("MemTotal: 100 kB\nSwapTotal: 1024 kB\nSwapFree: 256 kB\n").unwrap();
+        assert_eq!(swap, (1_048_576, 786_432));
+    }
 }

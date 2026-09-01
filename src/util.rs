@@ -36,11 +36,9 @@ pub fn now_epoch_seconds() -> u64 {
 }
 
 pub fn first_non_empty(values: &[Option<String>]) -> Option<String> {
-    for value in values {
-        if let Some(val) = value {
-            if !val.trim().is_empty() {
-                return Some(val.trim().to_string());
-            }
+    for value in values.iter().flatten() {
+        if !value.trim().is_empty() {
+            return Some(value.trim().to_string());
         }
     }
     None
